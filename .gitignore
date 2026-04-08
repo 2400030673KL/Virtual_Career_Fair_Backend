@@ -19,7 +19,6 @@ target/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Maven
 .m2/
