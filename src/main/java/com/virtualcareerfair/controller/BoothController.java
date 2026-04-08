@@ -17,7 +17,6 @@ import com.virtualcareerfair.service.InMemoryStore;
 
 import jakarta.validation.Valid;
 
-@CrossOrigin(origins = {"http://localhost:5173", "http://localhost:4173"})
 @RestController
 @RequestMapping("/api/booths")
 public class BoothController {
