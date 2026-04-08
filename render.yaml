@@ -11,4 +11,14 @@ services:
       - key: PORT
         value: 8080
       - key: CORS_ORIGIN
-        value: https://<your-frontend-url>.onrender.com
+        value: https://<your-frontend-domain>
+      - key: DATABASE_URL
+        value: jdbc:mysql://<mysql-host>:3306/virtualcareerfair?createDatabaseIfNotExist=true&useSSL=true&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      - key: DATABASE_USERNAME
+        value: <mysql-username>
+      - key: DATABASE_PASSWORD
+        value: <mysql-password>
+      - key: JWT_SECRET
+        value: <long-random-secret-min-32-bytes>
+      - key: JWT_EXPIRATION_MS
+        value: 86400000

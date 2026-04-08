@@ -1,5 +1,8 @@
 package com.virtualcareerfair.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.virtualcareerfair.dto.AdminLoginRequest;
 import com.virtualcareerfair.dto.AuthRequest;
 import com.virtualcareerfair.dto.AuthResponse;
@@ -14,32 +17,38 @@ import com.virtualcareerfair.dto.ResumeApplication;
 import com.virtualcareerfair.dto.ResumeCreateRequest;
 import com.virtualcareerfair.dto.ResumeStatusRequest;
 import com.virtualcareerfair.dto.UserSummary;
+import io.jsonwebtoken.JwtException;
+import jakarta.annotation.PostConstruct;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
 @Service
 public class InMemoryStore {
-    private final Map<String, RegisteredUser> usersByEmail = new LinkedHashMap<>();
-    private final Map<String, Booth> boothsById = new LinkedHashMap<>();
-    private final Map<String, CareerFair> fairsById = new LinkedHashMap<>();
-    private final Map<String, ResumeApplication> resumesById = new LinkedHashMap<>();
-    private final Map<String, List<ChatMessage>> chatByBoothId = new LinkedHashMap<>();
-    private final List<Registration> registrations = new ArrayList<>();
-
     private static final String ADMIN_EMAIL = "admin@virtualcareerfair.com";
     private static final String ADMIN_PASSWORD = "Admin@123";
 
-    public InMemoryStore() {
+    private final JdbcTemplate jdbcTemplate;
+    private final ObjectMapper objectMapper;
+    private final JwtService jwtService;
+
+    public InMemoryStore(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper, JwtService jwtService) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.objectMapper = objectMapper;
+        this.jwtService = jwtService;
+    }
+
+    @PostConstruct
+    public void initialize() {
         seedUsers();
         seedBooths();
         seedCareerFairs();
@@ -47,25 +56,32 @@ public class InMemoryStore {
         seedRegistrations();
     }
 
+    @Transactional
     public synchronized AuthResponse register(AuthRequest request) {
         String emailKey = normalize(request.email());
-        if (usersByEmail.containsKey(emailKey)) {
+        String role = normalizeRole(request.role());
+        if (userExists(emailKey)) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "User already exists");
         }
 
         RegisteredUser user = new RegisteredUser(
                 UUID.randomUUID().toString(),
                 request.name(),
-                request.email(),
-                request.password(),
-                request.role().toLowerCase());
-        usersByEmail.put(emailKey, user);
+                emailKey,
+                request.password().trim(),
+                role);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, name, email, password, role) VALUES (?, ?, ?, ?, ?)",
+                user.id(), user.name(), user.email(), user.password(), user.role());
         return successResponse(user, "Registration successful");
     }
 
     public synchronized AuthResponse login(LoginRequest request) {
-        RegisteredUser user = usersByEmail.get(normalize(request.email()));
-        if (user == null || !user.password().equals(request.password()) || !user.role().equalsIgnoreCase(request.role())) {
+        String email = normalize(request.email());
+        String password = request.password() == null ? "" : request.password().trim();
+        String role = normalizeRole(request.role());
+        RegisteredUser user = getUserByEmail(email);
+        if (user == null || !user.password().equals(password) || !user.role().equalsIgnoreCase(role)) {
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid credentials");
         }
         return successResponse(user, "Login successful");
@@ -79,84 +95,152 @@ public class InMemoryStore {
         return successResponse(admin, "Admin login successful");
     }
 
+    public synchronized AuthResponse authenticate(String token) {
+        if (isBlank(token)) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Missing token");
+        }
+
+        try {
+            UserSummary user = jwtService.parseUser(token);
+            return new AuthResponse(true, "Token valid", token, user);
+        } catch (JwtException | IllegalArgumentException exception) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid or expired token");
+        }
+    }
+
     public synchronized List<CareerFair> listCareerFairs() {
-        return new ArrayList<>(fairsById.values());
+        return jdbcTemplate.query(
+                "SELECT * FROM career_fairs ORDER BY name",
+                (resultSet, rowNum) -> mapCareerFair(
+                        resultSet.getString("id"),
+                        resultSet.getString("name"),
+                        resultSet.getString("date_value"),
+                        resultSet.getString("time_value"),
+                        resultSet.getString("location"),
+                        resultSet.getString("description"),
+                        resultSet.getString("companies_json"),
+                        resultSet.getString("status"),
+                        resultSet.getInt("registrations"),
+                        resultSet.getString("category")));
     }
 
     public synchronized CareerFair getCareerFair(String id) {
-        CareerFair fair = fairsById.get(id);
-        if (fair == null) {
+        List<CareerFair> fairs = jdbcTemplate.query(
+                "SELECT * FROM career_fairs WHERE id = ?",
+                (resultSet, rowNum) -> mapCareerFair(
+                        resultSet.getString("id"),
+                        resultSet.getString("name"),
+                        resultSet.getString("date_value"),
+                        resultSet.getString("time_value"),
+                        resultSet.getString("location"),
+                        resultSet.getString("description"),
+                        resultSet.getString("companies_json"),
+                        resultSet.getString("status"),
+                        resultSet.getInt("registrations"),
+                        resultSet.getString("category")),
+                id);
+        if (fairs.isEmpty()) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Career fair not found");
         }
-        return fair;
+        return fairs.get(0);
     }
 
+    @Transactional
     public synchronized CareerFair saveCareerFair(CareerFair fair) {
         String id = isBlank(fair.id()) ? nextId("fair") : fair.id();
-        CareerFair stored = new CareerFair(
-                id,
-                fair.name(),
-                fair.date(),
-                fair.time(),
-                fair.location(),
-                fair.description(),
-                copyList(fair.companies()),
-                fair.status(),
-                fair.registrations(),
-                fair.category());
-        fairsById.put(id, stored);
-        return stored;
+        jdbcTemplate.update(
+                "INSERT INTO career_fairs (id, name, date_value, time_value, location, description, companies_json, status, registrations, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE name = VALUES(name), date_value = VALUES(date_value), time_value = VALUES(time_value), location = VALUES(location), description = VALUES(description), companies_json = VALUES(companies_json), status = VALUES(status), registrations = VALUES(registrations), category = VALUES(category)",
+                id, fair.name(), fair.date(), fair.time(), fair.location(), fair.description(), writeJson(fair.companies()), fair.status(), fair.registrations(), fair.category());
+        return mapCareerFair(id, fair.name(), fair.date(), fair.time(), fair.location(), fair.description(), writeJson(fair.companies()), fair.status(), fair.registrations(), fair.category());
     }
 
     public synchronized void deleteCareerFair(String id) {
-        if (fairsById.remove(id) == null) {
+        int updated = jdbcTemplate.update("DELETE FROM career_fairs WHERE id = ?", id);
+        if (updated == 0) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Career fair not found");
         }
     }
 
     public synchronized List<Booth> listBooths() {
-        return new ArrayList<>(boothsById.values());
+        return jdbcTemplate.query(
+                "SELECT * FROM booths ORDER BY name",
+                (resultSet, rowNum) -> mapBooth(
+                        resultSet.getString("id"),
+                        resultSet.getString("name"),
+                        resultSet.getString("industry"),
+                        resultSet.getString("logo"),
+                        resultSet.getString("tagline"),
+                        resultSet.getString("description"),
+                        resultSet.getInt("open_roles"),
+                        resultSet.getString("location"),
+                        resultSet.getString("type"),
+                        resultSet.getDouble("rating"),
+                        resultSet.getString("employees"),
+                        resultSet.getString("positions_json"),
+                        resultSet.getString("perks_json"),
+                        resultSet.getString("color_json")));
     }
 
     public synchronized Booth getBooth(String id) {
-        Booth booth = boothsById.get(id);
-        if (booth == null) {
+        List<Booth> booths = jdbcTemplate.query(
+                "SELECT * FROM booths WHERE id = ?",
+                (resultSet, rowNum) -> mapBooth(
+                        resultSet.getString("id"),
+                        resultSet.getString("name"),
+                        resultSet.getString("industry"),
+                        resultSet.getString("logo"),
+                        resultSet.getString("tagline"),
+                        resultSet.getString("description"),
+                        resultSet.getInt("open_roles"),
+                        resultSet.getString("location"),
+                        resultSet.getString("type"),
+                        resultSet.getDouble("rating"),
+                        resultSet.getString("employees"),
+                        resultSet.getString("positions_json"),
+                        resultSet.getString("perks_json"),
+                        resultSet.getString("color_json")),
+                id);
+        if (booths.isEmpty()) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Booth not found");
         }
-        return booth;
+        return booths.get(0);
     }
 
+    @Transactional
     public synchronized Booth saveBooth(Booth booth) {
         String id = isBlank(booth.id()) ? nextId("booth") : booth.id();
-        Booth stored = new Booth(
-                id,
-                booth.name(),
-                booth.industry(),
-                booth.logo(),
-                booth.tagline(),
-                booth.description(),
-                booth.openRoles(),
-                booth.location(),
-                booth.type(),
-                booth.rating(),
-                booth.employees(),
-                copyList(booth.positions()),
-                copyList(booth.perks()),
-                booth.color() == null ? new ColorPalette("#1a73e8", "#e8f0fe", "#c6dafc") : new ColorPalette(booth.color().primary(), booth.color().light(), booth.color().border()));
-        boothsById.put(id, stored);
-        return stored;
+        ColorPalette color = booth.color() == null ? new ColorPalette("#1a73e8", "#e8f0fe", "#c6dafc") : booth.color();
+        jdbcTemplate.update(
+                "INSERT INTO booths (id, name, industry, logo, tagline, description, open_roles, location, type, rating, employees, positions_json, perks_json, color_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE name = VALUES(name), industry = VALUES(industry), logo = VALUES(logo), tagline = VALUES(tagline), description = VALUES(description), open_roles = VALUES(open_roles), location = VALUES(location), type = VALUES(type), rating = VALUES(rating), employees = VALUES(employees), positions_json = VALUES(positions_json), perks_json = VALUES(perks_json), color_json = VALUES(color_json)",
+                id, booth.name(), booth.industry(), booth.logo(), booth.tagline(), booth.description(), booth.openRoles(), booth.location(), booth.type(), booth.rating(), booth.employees(), writeJson(booth.positions()), writeJson(booth.perks()), writeJson(color));
+        return mapBooth(id, booth.name(), booth.industry(), booth.logo(), booth.tagline(), booth.description(), booth.openRoles(), booth.location(), booth.type(), booth.rating(), booth.employees(), writeJson(booth.positions()), writeJson(booth.perks()), writeJson(color));
     }
 
     public synchronized void deleteBooth(String id) {
-        if (boothsById.remove(id) == null) {
+        int updated = jdbcTemplate.update("DELETE FROM booths WHERE id = ?", id);
+        if (updated == 0) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Booth not found");
         }
     }
 
     public synchronized List<ResumeApplication> listResumes() {
-        return new ArrayList<>(resumesById.values());
+        return jdbcTemplate.query(
+                "SELECT * FROM resumes ORDER BY date_value DESC",
+            (resultSet, rowNum) -> new ResumeApplication(
+                resultSet.getString("id"),
+                resultSet.getString("name"),
+                resultSet.getString("email"),
+                resultSet.getString("position"),
+                resultSet.getString("company"),
+                resultSet.getString("summary"),
+                resultSet.getString("file_name"),
+                resultSet.getString("date_value"),
+                resultSet.getString("status")));
     }
 
+    @Transactional
     public synchronized ResumeApplication saveResume(ResumeCreateRequest request) {
         ResumeApplication resume = new ResumeApplication(
                 nextId("resume"),
@@ -168,65 +252,72 @@ public class InMemoryStore {
                 request.fileName(),
                 LocalDate.now().toString(),
                 "pending");
-        resumesById.put(resume.id(), resume);
-        registrations.add(new Registration(nextId("registration"), request.name(), request.email(), request.company(), "submitted", nowStamp()));
+        jdbcTemplate.update(
+                "INSERT INTO resumes (id, name, email, position, company, summary, file_name, date_value, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                resume.id(), resume.name(), resume.email(), resume.position(), resume.company(), resume.summary(), resume.fileName(), resume.date(), resume.status());
+        jdbcTemplate.update(
+                "INSERT INTO registrations (id, name, email, target, status, registered_at) VALUES (?, ?, ?, ?, ?, ?)",
+                nextId("registration"), request.name(), request.email(), request.company(), "submitted", nowStamp());
         return resume;
     }
 
+    @Transactional
     public synchronized ResumeApplication updateResumeStatus(String id, ResumeStatusRequest request) {
-        ResumeApplication existing = resumesById.get(id);
+        ResumeApplication existing = jdbcTemplate.query(
+                "SELECT * FROM resumes WHERE id = ?",
+            (resultSet, rowNum) -> new ResumeApplication(
+                resultSet.getString("id"),
+                resultSet.getString("name"),
+                resultSet.getString("email"),
+                resultSet.getString("position"),
+                resultSet.getString("company"),
+                resultSet.getString("summary"),
+                resultSet.getString("file_name"),
+                resultSet.getString("date_value"),
+                resultSet.getString("status")),
+                id).stream().findFirst().orElse(null);
         if (existing == null) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Resume not found");
         }
-        ResumeApplication updated = new ResumeApplication(
-                existing.id(),
-                existing.name(),
-                existing.email(),
-                existing.position(),
-                existing.company(),
-                existing.summary(),
-                existing.fileName(),
-                existing.date(),
-                request.status());
-        resumesById.put(id, updated);
-        return updated;
+
+        jdbcTemplate.update("UPDATE resumes SET status = ? WHERE id = ?", request.status(), id);
+        return new ResumeApplication(existing.id(), existing.name(), existing.email(), existing.position(), existing.company(), existing.summary(), existing.fileName(), existing.date(), request.status());
     }
 
     public synchronized List<ChatMessage> listMessages(String boothId) {
-        List<ChatMessage> messages = chatByBoothId.get(boothId);
-        if (messages == null) {
-            return new ArrayList<>();
-        }
-        return new ArrayList<>(messages);
+        return jdbcTemplate.query(
+                "SELECT * FROM chat_messages WHERE booth_id = ? ORDER BY timestamp_value ASC",
+                (resultSet, rowNum) -> new ChatMessage(resultSet.getString("id"), resultSet.getString("booth_id"), resultSet.getString("sender"), resultSet.getString("message"), resultSet.getString("timestamp_value")),
+                boothId);
     }
 
+    @Transactional
     public synchronized ChatMessage addMessage(String boothId, ChatMessageRequest request) {
         ChatMessage message = new ChatMessage(nextId("chat"), boothId, request.sender(), request.message(), nowStamp());
-        List<ChatMessage> messages = chatByBoothId.get(boothId);
-        if (messages == null) {
-            messages = new ArrayList<>();
-            chatByBoothId.put(boothId, messages);
-        }
-        messages.add(message);
+        jdbcTemplate.update(
+                "INSERT INTO chat_messages (id, booth_id, sender, message, timestamp_value) VALUES (?, ?, ?, ?, ?)",
+                message.id(), message.boothId(), message.sender(), message.message(), message.timestamp());
         return message;
     }
 
     public synchronized List<Registration> listRegistrations() {
-        return new ArrayList<>(registrations);
-    }
-
-    private AuthResponse successResponse(RegisteredUser user, String message) {
-        return new AuthResponse(true, message, UUID.randomUUID().toString(), new UserSummary(user.id(), user.name(), user.email(), user.role()));
+        return jdbcTemplate.query(
+                "SELECT * FROM registrations ORDER BY registered_at DESC",
+                (resultSet, rowNum) -> new Registration(resultSet.getString("id"), resultSet.getString("name"), resultSet.getString("email"), resultSet.getString("target"), resultSet.getString("status"), resultSet.getString("registered_at")));
     }
 
     private void seedUsers() {
-        RegisteredUser student = new RegisteredUser("user-1", "Student User", "student@demo.com", "Password123", "student");
-        RegisteredUser recruiter = new RegisteredUser("user-2", "Recruiter User", "recruiter@demo.com", "Password123", "recruiter");
-        usersByEmail.put(normalize(student.email()), student);
-        usersByEmail.put(normalize(recruiter.email()), recruiter);
+        if (countRows("users") > 0) {
+            return;
+        }
+        saveUser(new RegisteredUser("user-1", "Student User", "student@demo.com", "Password123", "student"));
+        saveUser(new RegisteredUser("user-2", "Recruiter User", "recruiter@demo.com", "Password123", "recruiter"));
     }
 
     private void seedBooths() {
+        if (countRows("booths") > 0) {
+            return;
+        }
         saveBooth(new Booth("0", "Google", "Technology", "🔵", "Organize the world's information",
                 "Google LLC is a multinational technology company specializing in Internet-related services and products. Join one of the most innovative teams in the world.",
                 24, "Mountain View, CA", "Full-time / Internship", 4.8, "180,000+",
@@ -266,6 +357,9 @@ public class InMemoryStore {
     }
 
     private void seedCareerFairs() {
+        if (countRows("career_fairs") > 0) {
+            return;
+        }
         saveCareerFair(new CareerFair("1", "Tech Career Fair 2026", "2026-03-25", "10:00 AM - 4:00 PM", "Virtual",
                 "Connect with leading tech companies including Google, Microsoft, Amazon, and more. Explore software engineering, data science, and AI roles.",
                 listOf("Google", "Microsoft", "Amazon", "Meta", "Apple"), "upcoming", 1245, "Technology"));
@@ -287,6 +381,9 @@ public class InMemoryStore {
     }
 
     private void seedResumes() {
+        if (countRows("resumes") > 0) {
+            return;
+        }
         seedResume(new ResumeCreateRequest("Alice Johnson", "alice.johnson@email.com", "Software Engineer", "Google",
                 "Computer Science graduate with 2+ years of experience in full-stack development. Proficient in React, Node.js, Python, and cloud technologies. Built scalable microservices handling 10K+ requests/sec. Strong background in data structures and algorithms.",
                 "alice_johnson_resume.pdf"));
@@ -305,23 +402,77 @@ public class InMemoryStore {
     }
 
     private void seedRegistrations() {
-        registrations.add(new Registration(nextId("registration"), "Ravi", "ravi@example.com", "Google Booth", "confirmed", nowStamp()));
-        registrations.add(new Registration(nextId("registration"), "Anjali", "anjali@example.com", "Amazon Booth", "confirmed", nowStamp()));
-        registrations.add(new Registration(nextId("registration"), "Teja", "teja@example.com", "Microsoft Booth", "confirmed", nowStamp()));
+        if (countRows("registrations") > 0) {
+            return;
+        }
+        jdbcTemplate.update("INSERT INTO registrations (id, name, email, target, status, registered_at) VALUES (?, ?, ?, ?, ?, ?)", nextId("registration"), "Ravi", "ravi@example.com", "Google Booth", "confirmed", nowStamp());
+        jdbcTemplate.update("INSERT INTO registrations (id, name, email, target, status, registered_at) VALUES (?, ?, ?, ?, ?, ?)", nextId("registration"), "Anjali", "anjali@example.com", "Amazon Booth", "confirmed", nowStamp());
+        jdbcTemplate.update("INSERT INTO registrations (id, name, email, target, status, registered_at) VALUES (?, ?, ?, ?, ?, ?)", nextId("registration"), "Teja", "teja@example.com", "Microsoft Booth", "confirmed", nowStamp());
+    }
+
+    private void saveUser(RegisteredUser user) {
+        jdbcTemplate.update("INSERT INTO users (id, name, email, password, role) VALUES (?, ?, ?, ?, ?)", user.id(), user.name(), user.email(), user.password(), user.role());
     }
 
     private void seedResume(ResumeCreateRequest request) {
-        ResumeApplication resume = new ResumeApplication(
-                nextId("resume"),
-                request.name(),
-                request.email(),
-                request.position(),
-                request.company(),
-                request.summary(),
-                request.fileName(),
-                LocalDate.now().toString(),
-                "pending");
-        resumesById.put(resume.id(), resume);
+        ResumeApplication resume = new ResumeApplication(nextId("resume"), request.name(), request.email(), request.position(), request.company(), request.summary(), request.fileName(), LocalDate.now().toString(), "pending");
+        jdbcTemplate.update("INSERT INTO resumes (id, name, email, position, company, summary, file_name, date_value, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", resume.id(), resume.name(), resume.email(), resume.position(), resume.company(), resume.summary(), resume.fileName(), resume.date(), resume.status());
+    }
+
+    private CareerFair mapCareerFair(String id, String name, String date, String time, String location, String description, String companiesJson, String status, int registrations, String category) {
+        return new CareerFair(id, name, date, time, location, description, readStringList(companiesJson), status, registrations, category);
+    }
+
+    private Booth mapBooth(String id, String name, String industry, String logo, String tagline, String description, int openRoles, String location, String type, double rating, String employees, String positionsJson, String perksJson, String colorJson) {
+        return new Booth(id, name, industry, logo, tagline, description, openRoles, location, type, rating, employees, readStringList(positionsJson), readStringList(perksJson), readColorPalette(colorJson));
+    }
+
+    private boolean userExists(String email) {
+        Integer count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM users WHERE LOWER(email) = LOWER(?)", Integer.class, email);
+        return count != null && count > 0;
+    }
+
+    private RegisteredUser getUserByEmail(String email) {
+        List<RegisteredUser> users = jdbcTemplate.query(
+                "SELECT * FROM users WHERE LOWER(email) = LOWER(?)",
+                (resultSet, rowNum) -> new RegisteredUser(resultSet.getString("id"), resultSet.getString("name"), resultSet.getString("email"), resultSet.getString("password"), resultSet.getString("role")),
+                email);
+        return users.isEmpty() ? null : users.get(0);
+    }
+
+    private int countRows(String tableName) {
+        Integer count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + tableName, Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    private List<String> readStringList(String json) {
+        if (json == null || json.isBlank()) {
+            return new ArrayList<>();
+        }
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<String>>() {});
+        } catch (JsonProcessingException exception) {
+            return new ArrayList<>();
+        }
+    }
+
+    private ColorPalette readColorPalette(String json) {
+        if (json == null || json.isBlank()) {
+            return new ColorPalette("#1a73e8", "#e8f0fe", "#c6dafc");
+        }
+        try {
+            return objectMapper.readValue(json, ColorPalette.class);
+        } catch (JsonProcessingException exception) {
+            return new ColorPalette("#1a73e8", "#e8f0fe", "#c6dafc");
+        }
+    }
+
+    private String writeJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException("Failed to serialize database payload", exception);
+        }
     }
 
     private List<String> listOf(String... values) {
@@ -332,19 +483,16 @@ public class InMemoryStore {
         return items;
     }
 
-    private List<String> copyList(List<String> values) {
-        if (values == null) {
-            return new ArrayList<>();
-        }
-        return new ArrayList<>(values);
-    }
-
     private String normalize(String email) {
         return email == null ? "" : email.trim().toLowerCase();
     }
 
+    private String normalizeRole(String role) {
+        return role == null ? "" : role.trim().toLowerCase();
+    }
+
     private String nextId(String prefix) {
-        return prefix + "-" + UUID.randomUUID().toString();
+        return prefix + "-" + UUID.randomUUID();
     }
 
     private String nowStamp() {
@@ -353,6 +501,11 @@ public class InMemoryStore {
 
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    private AuthResponse successResponse(RegisteredUser user, String message) {
+        UserSummary userSummary = new UserSummary(user.id(), user.name(), user.email(), user.role());
+        return new AuthResponse(true, message, jwtService.generateToken(userSummary), userSummary);
     }
 
     private static final class RegisteredUser {
