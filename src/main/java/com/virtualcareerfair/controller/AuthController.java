@@ -1,11 +1,5 @@
 package com.virtualcareerfair.controller;
 
-import com.virtualcareerfair.dto.AdminLoginRequest;
-import com.virtualcareerfair.dto.AuthRequest;
-import com.virtualcareerfair.dto.AuthResponse;
-import com.virtualcareerfair.dto.LoginRequest;
-import com.virtualcareerfair.service.InMemoryStore;
-import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -14,6 +8,14 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
+
+import com.virtualcareerfair.dto.AdminLoginRequest;
+import com.virtualcareerfair.dto.AuthRequest;
+import com.virtualcareerfair.dto.AuthResponse;
+import com.virtualcareerfair.dto.LoginRequest;
+import com.virtualcareerfair.service.InMemoryStore;
+
+import jakarta.validation.Valid;
 
 @RestController
 @RequestMapping("/api/auth")
