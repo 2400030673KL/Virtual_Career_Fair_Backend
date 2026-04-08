@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: virtual-career-fair-backend
+    runtime: docker
+    region: oregon
+    plan: free
+    autoDeploy: true
+    buildCommand: docker build -t virtual-career-fair-backend .
+    startCommand: java -jar app.jar
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: CORS_ORIGIN
+        value: https://<your-frontend-url>.onrender.com
